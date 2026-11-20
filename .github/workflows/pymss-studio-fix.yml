@@ -39,84 +39,78 @@ jobs:
           @'
           import fs from 'node:fs';
           import path from 'node:path';
-          
+
+          // Pymss Studio user patch v3: designed for both CRLF and LF source code.
           const root = process.argv[2] ? path.resolve(process.argv[2]) : process.cwd();
           const changes = [];
-          
-          function edit(relative, change) {
-            const file = path.join(root, relative);
-            if (!fs.existsSync(file)) throw new Error(`Missing source file: ${file}`);
-            const original = fs.readFileSync(file, 'utf8');
-            const updated = change(original);
-            if (updated === original) {
-              console.log(`Already patched: ${relative}`);
-              return;
-            }
-            changes.push({file, relative, original, updated});
+
+          function edit(relative, update) {
+            const filename = path.join(root, relative);
+            if (!fs.existsSync(filename)) throw new Error(`Missing source file: ${filename}`);
+            const before = fs.readFileSync(filename, 'utf8');
+            const after = update(before);
+            if (before !== after) changes.push({ filename, relative, before, after });
+            else console.log(`Unchanged or already patched: ${relative}`);
           }
-          function replaceOnce(original, needle, substitute, label) {
-            const first = original.indexOf(needle);
-            if (first < 0) throw new Error(`Source mismatch: ${label}. No changes written.`);
-            if (original.indexOf(needle, first + needle.length) !== -1) throw new Error(`Ambiguous source: ${label}. No changes written.`);
-            return original.slice(0, first) + substitute + original.slice(first + needle.length);
+          function replaceUnique(source, regex, replacement, label) {
+            const matches = [...source.matchAll(new RegExp(regex.source, 'g' + regex.flags.replace('g', '')))];
+            if (matches.length !== 1) throw new Error(`${label}: expected one code anchor, found ${matches.length}. No changes written.`);
+            return source.replace(regex, replacement);
           }
-          
+
           try {
-            edit('src/stores/task.ts', original => {
-              const start = original.indexOf('function saveCurrentModelState(');
-              const end = original.indexOf('function getSavedModelState(', start);
-              if (start < 0 || end < 0) throw new Error('Unable to locate model-specific selection state code');
-              let section = original.slice(start, end);
-              if (section.includes('PYMSS_STEMS_IMMEDIATE_SAVE')) return original;
-              section = replaceOnce(section,
-                'queueSeparateStatePersist()',
-                `// PYMSS_STEMS_IMMEDIATE_SAVE: persist stem choices without the timer race.\n  // The app-store layer also maintains a local mirror for a failed backend save.\n  if (separateStateSaveTimer) {\n    clearTimeout(separateStateSaveTimer)\n    separateStateSaveTimer = null\n  }\n  persistSeparateState()`,
-                'model-stem persistence');
-              return original.slice(0, start) + section + original.slice(end);
+            edit('src/stores/task.ts', source => {
+              if (source.includes('PYMSS_IMMEDIATE_STEMS_V3')) return source;
+              const start = source.indexOf('function saveCurrentModelState(');
+              const end = source.indexOf('function getSavedModelState(', start);
+              if (start < 0 || end < 0) throw new Error('Cannot locate saveCurrentModelState function');
+              let part = source.slice(start, end);
+              part = replaceUnique(part, /\bqueueSeparateStatePersist\(\)/,
+                '/* PYMSS_IMMEDIATE_STEMS_V3: save without 120ms delay */ persistSeparateState()',
+                'model selection persistence');
+              return source.slice(0, start) + part + source.slice(end);
             });
-          
-            edit('src/utils/appStore.ts', original => {
-              if (original.includes('PYMSS_SEPARATE_STORE_MIRROR')) return original;
-              let result = replaceOnce(original,
-                "  try {\n    const value = await invoke<T | null>('load_app_store', { name })",
-                `  // PYMSS_SEPARATE_STORE_MIRROR: prefer the most recently saved window-local\n  // selection settings, including when native persistence was rejected.\n  if (name === 'separate-state') {\n    const mirror = readLocalStore<T>(name)\n    if (mirror) return mirror\n  }\n  try {\n    const value = await invoke<T | null>('load_app_store', { name })`,
-                'load separate-state mirror');
-              result = replaceOnce(result,
-                "    if (isMissingUpdateStore(error, name)) return readLocalStore<T>(name)",
-                "    if (name === 'separate-state' || isMissingUpdateStore(error, name)) return readLocalStore<T>(name)",
-                'load error fallback');
-              result = replaceOnce(result,
-                "  try {\n    await invoke('save_app_store', { name, data })",
-                `  // Keep a second durable copy for separate-state. Other app stores keep\n  // their original Rust behavior and are not affected by this workaround.\n  if (name === 'separate-state') {\n    try { localStorage.setItem(localStoreKey(name), serialized) } catch { /* Native store still available. */ }\n  }\n  try {\n    await invoke('save_app_store', { name, data })`,
-                'native save mirror');
-              result = replaceOnce(result,
-                "    if (!isMissingUpdateStore(error, name)) throw error",
-                "    if (name === 'separate-state') {\n      // A successful local mirror prevents losing stem preferences.\n      if (readLocalStore(name)) return\n    }\n    if (!isMissingUpdateStore(error, name)) throw error",
-                'native store save fallback');
-              return result;
+
+            edit('src/utils/appStore.ts', source => {
+              if (source.includes('PYMSS_LOCAL_STEMS_MIRROR_V3')) return source;
+              // Prefer the last committed selection snapshot in localStorage. This
+              // also survives a native-store save rejected during app shutdown.
+              source = replaceUnique(source,
+                /(\bconst\s+value\s*=\s*await\s+invoke\s*<\s*T\s*\|\s*null\s*>\s*\(\s*['"]load_app_store['"]\s*,\s*\{\s*name\s*\}\s*\))/,
+                `// PYMSS_LOCAL_STEMS_MIRROR_V3\n    if (name === 'separate-state') {\n      try {\n        const mirror = readLocalStore<T>(name)\n        if (mirror) return mirror\n      } catch { /* localStorage blocked; native store remains available */ }\n    }\n    $1`,
+                'read separate-state mirror');
+              // If native persistence fails (e.g. store denied), still load the mirror.
+              source = replaceUnique(source,
+                /if\s*\(\s*isMissingUpdateStore\(\s*error\s*,\s*name\s*\)\s*\)\s*return\s+readLocalStore\s*<\s*T\s*>\s*\(\s*name\s*\)/,
+                `if (name === 'separate-state' || isMissingUpdateStore(error, name)) return readLocalStore<T>(name)`,
+                'native read fallback');
+              // Write mirror synchronously BEFORE scheduling any native async writes.
+              source = replaceUnique(source,
+                /(snapshot\s*=\s*JSON\.parse\s*\(\s*serialized\s*\)\s+as\s+unknown)/,
+                `$1\n    if (name === 'separate-state') {\n      try { localStorage.setItem(localStoreKey(name), serialized) }\n      catch { /* Native store is still attempted below. */ }\n    }`,
+                'synchronous separate-state mirror');
+              return source;
             });
-          
-            edit('src-tauri/tauri.conf.json', original => {
-              const config = JSON.parse(original);
-              if (!config?.app?.windows?.length) throw new Error('No Tauri windows config');
-              if (config.app.windows[0].maximized === true) return original;
-              // Preserve original source formatting and avoid rewriting the entire file.
-              const pattern = /("height"\s*:\s*\d+\s*,)/;
-              if (!pattern.test(original)) throw new Error('No main-window height anchor');
-              return original.replace(pattern, '$1\n      "maximized": true,');
+
+            edit('src-tauri/tauri.conf.json', source => {
+              const config = JSON.parse(source);
+              if (!config?.app?.windows?.length) throw new Error('Tauri main window not found');
+              if (config.app.windows[0].maximized === true) return source;
+              // Only insert the main window's maximized flag, keep all other configuration.
+              config.app.windows[0].maximized = true;
+              return JSON.stringify(config, null, 2) + '\n';
             });
-          
-            // Transactional: validate all before touching any; save backups on first run.
+
+            // Only write files when all compatibility checks have succeeded.
             for (const entry of changes) {
-              const backup = `${entry.file}.pre-pymss-fix.bak`;
-              if (!fs.existsSync(backup)) fs.writeFileSync(backup, entry.original, 'utf8');
+              const backup = entry.filename + '.pre-pymss-fix-v3.bak';
+              if (!fs.existsSync(backup)) fs.writeFileSync(backup, entry.before, 'utf8');
             }
             for (const entry of changes) {
-              fs.writeFileSync(entry.file, entry.updated, 'utf8');
+              fs.writeFileSync(entry.filename, entry.after, 'utf8');
               console.log(`Patched: ${entry.relative}`);
             }
-            if (!changes.length) console.log('Source is already patched.');
-            console.log('Patch applied. Build the Tauri app for Windows to use the changed code.');
+            console.log('Pymss source patch v3 complete');
           } catch (error) {
             console.error(`PATCH FAILED: ${error.message}`);
             process.exitCode = 1;
@@ -126,7 +120,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node "$env:RUNNER_TEMP\patch-pymss.mjs" "."
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Write-Host "Zastosowano trzy poprawki zrodel."
+          Write-Host "Zastosowano poprawki Pymss Studio v3."
 
       - name: Instaluj pakiety (na serwerze GitHub)
         shell: pwsh
