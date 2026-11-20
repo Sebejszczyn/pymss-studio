@@ -1,0 +1,152 @@
+name: Pymss Studio - poprawiony Windows EXE (bez instalacji Rust)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Build Pymss Studio Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Pobierz kod Pymss Studio z Twojego fork
+        uses: actions/checkout@v4
+
+      - name: Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: pnpm 10.33.2
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Rust w chmurze GitHub (nie na Twoim komputerze)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Nanies poprawki na kod zrodlowy
+        shell: pwsh
+        run: |
+          @'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          
+          const root = process.argv[2] ? path.resolve(process.argv[2]) : process.cwd();
+          const changes = [];
+          
+          function edit(relative, change) {
+            const file = path.join(root, relative);
+            if (!fs.existsSync(file)) throw new Error(`Missing source file: ${file}`);
+            const original = fs.readFileSync(file, 'utf8');
+            const updated = change(original);
+            if (updated === original) {
+              console.log(`Already patched: ${relative}`);
+              return;
+            }
+            changes.push({file, relative, original, updated});
+          }
+          function replaceOnce(original, needle, substitute, label) {
+            const first = original.indexOf(needle);
+            if (first < 0) throw new Error(`Source mismatch: ${label}. No changes written.`);
+            if (original.indexOf(needle, first + needle.length) !== -1) throw new Error(`Ambiguous source: ${label}. No changes written.`);
+            return original.slice(0, first) + substitute + original.slice(first + needle.length);
+          }
+          
+          try {
+            edit('src/stores/task.ts', original => {
+              const start = original.indexOf('function saveCurrentModelState(');
+              const end = original.indexOf('function getSavedModelState(', start);
+              if (start < 0 || end < 0) throw new Error('Unable to locate model-specific selection state code');
+              let section = original.slice(start, end);
+              if (section.includes('PYMSS_STEMS_IMMEDIATE_SAVE')) return original;
+              section = replaceOnce(section,
+                'queueSeparateStatePersist()',
+                `// PYMSS_STEMS_IMMEDIATE_SAVE: persist stem choices without the timer race.\n  // The app-store layer also maintains a local mirror for a failed backend save.\n  if (separateStateSaveTimer) {\n    clearTimeout(separateStateSaveTimer)\n    separateStateSaveTimer = null\n  }\n  persistSeparateState()`,
+                'model-stem persistence');
+              return original.slice(0, start) + section + original.slice(end);
+            });
+          
+            edit('src/utils/appStore.ts', original => {
+              if (original.includes('PYMSS_SEPARATE_STORE_MIRROR')) return original;
+              let result = replaceOnce(original,
+                "  try {\n    const value = await invoke<T | null>('load_app_store', { name })",
+                `  // PYMSS_SEPARATE_STORE_MIRROR: prefer the most recently saved window-local\n  // selection settings, including when native persistence was rejected.\n  if (name === 'separate-state') {\n    const mirror = readLocalStore<T>(name)\n    if (mirror) return mirror\n  }\n  try {\n    const value = await invoke<T | null>('load_app_store', { name })`,
+                'load separate-state mirror');
+              result = replaceOnce(result,
+                "    if (isMissingUpdateStore(error, name)) return readLocalStore<T>(name)",
+                "    if (name === 'separate-state' || isMissingUpdateStore(error, name)) return readLocalStore<T>(name)",
+                'load error fallback');
+              result = replaceOnce(result,
+                "  try {\n    await invoke('save_app_store', { name, data })",
+                `  // Keep a second durable copy for separate-state. Other app stores keep\n  // their original Rust behavior and are not affected by this workaround.\n  if (name === 'separate-state') {\n    try { localStorage.setItem(localStoreKey(name), serialized) } catch { /* Native store still available. */ }\n  }\n  try {\n    await invoke('save_app_store', { name, data })`,
+                'native save mirror');
+              result = replaceOnce(result,
+                "    if (!isMissingUpdateStore(error, name)) throw error",
+                "    if (name === 'separate-state') {\n      // A successful local mirror prevents losing stem preferences.\n      if (readLocalStore(name)) return\n    }\n    if (!isMissingUpdateStore(error, name)) throw error",
+                'native store save fallback');
+              return result;
+            });
+          
+            edit('src-tauri/tauri.conf.json', original => {
+              const config = JSON.parse(original);
+              if (!config?.app?.windows?.length) throw new Error('No Tauri windows config');
+              if (config.app.windows[0].maximized === true) return original;
+              // Preserve original source formatting and avoid rewriting the entire file.
+              const pattern = /("height"\s*:\s*\d+\s*,)/;
+              if (!pattern.test(original)) throw new Error('No main-window height anchor');
+              return original.replace(pattern, '$1\n      "maximized": true,');
+            });
+          
+            // Transactional: validate all before touching any; save backups on first run.
+            for (const entry of changes) {
+              const backup = `${entry.file}.pre-pymss-fix.bak`;
+              if (!fs.existsSync(backup)) fs.writeFileSync(backup, entry.original, 'utf8');
+            }
+            for (const entry of changes) {
+              fs.writeFileSync(entry.file, entry.updated, 'utf8');
+              console.log(`Patched: ${entry.relative}`);
+            }
+            if (!changes.length) console.log('Source is already patched.');
+            console.log('Patch applied. Build the Tauri app for Windows to use the changed code.');
+          } catch (error) {
+            console.error(`PATCH FAILED: ${error.message}`);
+            process.exitCode = 1;
+          }
+          '@ | Set-Content -LiteralPath "$env:RUNNER_TEMP\patch-pymss.mjs" -Encoding UTF8
+          node --check "$env:RUNNER_TEMP\patch-pymss.mjs"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node "$env:RUNNER_TEMP\patch-pymss.mjs" "."
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "Zastosowano trzy poprawki zrodel."
+
+      - name: Instaluj pakiety (na serwerze GitHub)
+        shell: pwsh
+        run: pnpm install --frozen-lockfile
+
+      - name: Zbuduj Pymss Studio EXE na Windows
+        shell: pwsh
+        run: pnpm tauri build --no-bundle
+
+      - name: Upewnij sie, ze EXE istnieje
+        shell: pwsh
+        run: |
+          $files = @(Get-ChildItem -Path 'src-tauri/target/release' -Filter '*pymss*.exe' -File -ErrorAction SilentlyContinue)
+          if ($files.Count -eq 0) { throw 'Kompilacja nie wygenerowala pliku Pymss Studio EXE.' }
+          $files | ForEach-Object { Write-Host "EXE: $($_.FullName)" }
+
+      - name: Udostepnij gotowy EXE do pobrania
+        uses: actions/upload-artifact@v4
+        with:
+          name: PymssStudio_Poprawiony_Windows_x64
+          path: src-tauri/target/release/*pymss*.exe
+          if-no-files-found: error
+          retention-days: 7
